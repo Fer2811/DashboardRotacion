@@ -47,10 +47,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ============================================================
 
 #DESKTOP = Path.home() / "Desktop"
-#CARPETA = DESKTOP / "rotacion_inventario_base_dashboard"
 DESKTOP = Path(r"C:\Users\luisf\IQ Tech\DashboardRotacion")
 CARPETA = Path(r"C:\Users\luisf\IQ Tech\DashboardRotacion")
-
 
 ARCHIVO_ENTRADA = CARPETA / "rotacion_inventario_base_dashboard_odoo_autoazur.xlsx"
 ARCHIVO_SALIDA = CARPETA / "base_dashboard_rotacion.xlsx"
@@ -64,7 +62,7 @@ ARCHIVO_SALIDA = CARPETA / "base_dashboard_rotacion.xlsx"
 # A partir de ese corte, el dashboard NO debe usar el stock descargado
 # como stock actual final, sino:
 #
-# stock_actual_calculado = stock_congelado_02062026_1500 - ventas_posteriores_al_corte
+# stock_actual_calculado = stock_congelado_02062026_1500 + arribos_odoo_post_corte - ventas_posteriores_al_corte
 #
 # La primera vez que corras este script, si no existe el archivo
 # stock_congelado_02062026_1500.xlsx, el código lo crea usando el stock
@@ -90,7 +88,24 @@ ODOO_API_KEY = os.getenv("ODOO_API_KEY", "d4340db6fc78dcba7c75bda7ba5fe2f5e6d573
 ODOO_CAMPO_TIPO_VENTA = os.getenv("ODOO_CAMPO_TIPO_VENTA", "x_studio_tipo_de_venta")
 ODOO_TIPOS_VENTA_VALIDOS = ["full", "drop"]
 
-# Para ventas no vinculadas ahora usaremos SOLO logs reales de Odoo.
+# ============================================================
+# ARRIBOS ODOO COMPRAS
+# ============================================================
+# Sustituye el archivo manual de arribos.
+# El código toma arribos desde purchase.order.line usando qty_received.
+ENABLE_ODOO_ARRIBOS_COMPRAS = True
+ODOO_ESTADOS_COMPRA_VALIDOS = ["purchase", "done"]
+
+# Para auditar, extraemos TODOS los arribos de Odoo Compras con qty_received > 0.
+# Para el cálculo de stock, solo se SUMAN los arribos posteriores al corte.
+EXTRAER_TODOS_LOS_ARRIBOS_ODOO = True
+
+# Si EXTRAER_TODOS_LOS_ARRIBOS_ODOO = False, usa este rango.
+FECHA_INICIO_ARRIBOS_ODOO = pd.Timestamp("2025-11-01")
+
+# Para el cálculo de stock, solo se suman arribos posteriores al corte:
+# FECHA_CORTE_STOCK = 2026-06-02 15:00:00
+# La fecha se reporta como fecha corta en el Excel.
 # Si conoces el modelo técnico del log, configúralo aquí o por variable de entorno.
 # Ejemplos posibles: "autoazur.log", "x_autoazur_log", "queue.job", etc.
 ODOO_LOG_MODEL = os.getenv("ODOO_LOG_MODEL", "").strip()
@@ -865,6 +880,267 @@ else:
 
 
 
+
+# ============================================================
+# ARRIBOS DESDE ODOO COMPRAS
+# ============================================================
+
+def detectar_iq_en_texto(texto):
+    texto = str(texto or "")
+    m = re.search(r"\b(IQ\d+)\b", texto, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return ""
+
+
+def fecha_corta(x):
+    dt = pd.to_datetime(x, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.strftime("%Y-%m-%d")
+
+
+def extraer_arribos_odoo_compras(fecha_inicio=None, fecha_fin=None):
+    """
+    Extrae TODOS los arribos directamente de Odoo Compras.
+
+    Fuente:
+    - purchase.order.line
+    - qty_received = cantidad recibida acumulada en la línea de compra
+
+    Importante:
+    - Esta función trae todos los renglones recibidos.
+    - NO se limita al último arribo.
+    - Después, otra función filtra cuáles son posteriores al corte para sumarlos al stock.
+    """
+    cols = [
+        "fecha", "fecha_dt", "orden_compra", "proveedor", "referencia_interna",
+        "producto", "cantidad_arribada", "cantidad_ordenada", "sku_odoo",
+        "barcode", "estado_compra", "origen", "precio_unitario", "subtotal",
+        "purchase_line_id", "product_id", "post_corte_stock"
+    ]
+
+    if not ENABLE_ODOO_ARRIBOS_COMPRAS:
+        print("Arribos Odoo omitidos: ENABLE_ODOO_ARRIBOS_COMPRAS=False.")
+        return pd.DataFrame(columns=cols)
+
+    if not es_credencial_odoo_valida():
+        print("Arribos Odoo omitidos: credenciales no configuradas.")
+        return pd.DataFrame(columns=cols)
+
+    try:
+        odoo = OdooClient(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_API_KEY)
+        odoo.connect()
+
+        # Base del dominio: TODOS los renglones de compras ya recibidos.
+        domain = [
+            ("order_id.state", "in", ODOO_ESTADOS_COMPRA_VALIDOS),
+            ("product_id", "!=", False),
+            ("qty_received", ">", 0),
+        ]
+
+        # Si quieres limitar por rango, apaga EXTRAER_TODOS_LOS_ARRIBOS_ODOO.
+        if not EXTRAER_TODOS_LOS_ARRIBOS_ODOO:
+            fecha_inicio = fecha_inicio or FECHA_INICIO_ARRIBOS_ODOO
+            fecha_fin = fecha_fin or pd.Timestamp.today().normalize()
+            dt_ini = pd.to_datetime(fecha_inicio).strftime("%Y-%m-%d 00:00:00")
+            dt_fin = (pd.to_datetime(fecha_fin).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+            domain.extend([
+                ("order_id.date_order", ">=", dt_ini),
+                ("order_id.date_order", "<", dt_fin),
+            ])
+
+        fields_line = [
+            "id",
+            "order_id",
+            "product_id",
+            "name",
+            "product_qty",
+            "qty_received",
+            "price_unit",
+            "price_subtotal",
+            "date_planned",
+        ]
+
+        lineas = odoo.search_read_all(
+            "purchase.order.line",
+            domain,
+            fields_line,
+            batch=2000,
+            order="id asc"
+        )
+
+        if not lineas:
+            print("No encontré arribos Odoo Compras con qty_received > 0.")
+            return pd.DataFrame(columns=cols)
+
+        order_ids = sorted({
+            m2o_id(l.get("order_id"))
+            for l in lineas
+            if m2o_id(l.get("order_id"))
+        })
+
+        product_ids = sorted({
+            m2o_id(l.get("product_id"))
+            for l in lineas
+            if m2o_id(l.get("product_id"))
+        })
+
+        order_fields = [
+            "id",
+            "name",
+            "date_order",
+            "date_approve",
+            "effective_date",
+            "state",
+            "partner_id",
+            "origin",
+            "amount_total",
+        ]
+
+        try:
+            orders = odoo.execute(
+                "purchase.order",
+                "read",
+                order_ids,
+                order_fields
+            ) if order_ids else []
+        except Exception:
+            orders = odoo.execute(
+                "purchase.order",
+                "read",
+                order_ids,
+                ["id", "name", "date_order", "state", "partner_id", "origin", "amount_total"]
+            ) if order_ids else []
+
+        products = odoo.execute(
+            "product.product",
+            "read",
+            product_ids,
+            ["id", "display_name", "default_code", "barcode", "categ_id"]
+        ) if product_ids else []
+
+        order_map = {o["id"]: o for o in orders}
+        product_map = {p["id"]: p for p in products}
+
+        rows = []
+
+        for l in lineas:
+            order_id = m2o_id(l.get("order_id"))
+            product_id = m2o_id(l.get("product_id"))
+
+            o = order_map.get(order_id, {})
+            p = product_map.get(product_id, {})
+
+            producto_nombre = p.get("display_name") or l.get("name", "")
+            default_code = limpiar_sku(p.get("default_code", ""))
+            barcode = limpiar_sku(p.get("barcode", ""))
+
+            referencia_interna = ""
+            if re.fullmatch(r"IQ\d+", default_code.upper()):
+                referencia_interna = default_code.upper()
+            else:
+                referencia_interna = (
+                    detectar_iq_en_texto(producto_nombre)
+                    or detectar_iq_en_texto(l.get("name", ""))
+                    or default_code
+                )
+
+            # Odoo purchase.order.line no siempre tiene fecha real por recepción individual.
+            # Para este primer cruce se usa la mejor fecha disponible:
+            # effective_date > date_approve > date_order > date_planned
+            fecha_base = (
+                o.get("effective_date")
+                or o.get("date_approve")
+                or o.get("date_order")
+                or l.get("date_planned")
+            )
+            fecha_dt = pd.to_datetime(fecha_base, errors="coerce")
+
+            rows.append({
+                "fecha": fecha_corta(fecha_dt),
+                "fecha_dt": fecha_dt,
+                "orden_compra": o.get("name", ""),
+                "proveedor": m2o_name(o.get("partner_id")),
+                "referencia_interna": str(referencia_interna).strip(),
+                "producto": producto_nombre,
+                "cantidad_arribada": float(l.get("qty_received") or 0),
+                "cantidad_ordenada": float(l.get("product_qty") or 0),
+                "sku_odoo": default_code,
+                "barcode": barcode,
+                "estado_compra": o.get("state", ""),
+                "origen": o.get("origin", ""),
+                "precio_unitario": float(l.get("price_unit") or 0),
+                "subtotal": float(l.get("price_subtotal") or 0),
+                "purchase_line_id": l.get("id"),
+                "product_id": product_id,
+                "post_corte_stock": "SI" if pd.notna(fecha_dt) and fecha_dt > FECHA_CORTE_STOCK else "NO",
+            })
+
+        df = pd.DataFrame(rows)
+
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+
+        df["referencia_interna"] = df["referencia_interna"].astype(str).str.strip()
+        df = df[df["referencia_interna"].ne("")].copy()
+        df["cantidad_arribada"] = to_num(df["cantidad_arribada"])
+        df["cantidad_ordenada"] = to_num(df["cantidad_ordenada"])
+
+        df = df.sort_values(["fecha_dt", "orden_compra", "referencia_interna"]).reset_index(drop=True)
+
+        print(f"Arribos Odoo Compras extraídos TODOS: {len(df)}")
+        print(f"Cantidad arribada total Odoo: {df['cantidad_arribada'].sum():,.0f}")
+        print(f"Arribos post corte para stock: {(df['post_corte_stock'] == 'SI').sum()}")
+
+        return df
+
+    except Exception as e:
+        print(f"No pude extraer arribos desde Odoo Compras: {e}")
+        return pd.DataFrame(columns=cols)
+
+
+def calcular_arribos_posteriores_corte_odoo():
+    """
+    Extrae TODOS los arribos de Odoo, pero para el cálculo de inventario
+    solo suma los marcados como posteriores al corte.
+    """
+    arribos_todos = extraer_arribos_odoo_compras(FECHA_INICIO_ARRIBOS_ODOO, pd.Timestamp.today().normalize())
+
+    cols_res = [
+        "sku_madre", "arribos_post_corte_unidades", "arribos_post_corte_monto",
+        "ordenes_compra_arribos", "proveedores_arribos", "primera_fecha_arribo",
+        "ultima_fecha_arribo"
+    ]
+
+    if arribos_todos.empty:
+        return pd.DataFrame(columns=cols_res), arribos_todos
+
+    arribos = arribos_todos.copy()
+    arribos["sku_madre"] = arribos["referencia_interna"].astype(str).str.strip().str.upper()
+    arribos = arribos[arribos["sku_madre"].str.match(r"^IQ\d+$", na=False)].copy()
+
+    # Solo estos se suman al stock congelado.
+    arribos_post = arribos[arribos["post_corte_stock"].astype(str).str.upper().eq("SI")].copy()
+
+    if arribos_post.empty:
+        return pd.DataFrame(columns=cols_res), arribos_todos
+
+    resumen = (
+        arribos_post.groupby("sku_madre", as_index=False)
+        .agg(
+            arribos_post_corte_unidades=("cantidad_arribada", "sum"),
+            arribos_post_corte_monto=("subtotal", "sum"),
+            ordenes_compra_arribos=("orden_compra", lambda x: " | ".join(sorted(set(map(str, x))))),
+            proveedores_arribos=("proveedor", lambda x: " | ".join(sorted(set(map(str, x))))),
+            primera_fecha_arribo=("fecha", "min"),
+            ultima_fecha_arribo=("fecha", "max"),
+        )
+    )
+
+    return resumen, arribos_todos
+
+
 # ============================================================
 # STOCK CONGELADO / DESCUENTO DE VENTAS POSTERIORES
 # ============================================================
@@ -1011,51 +1287,82 @@ def calcular_ventas_posteriores_corte(ventas_df):
 def aplicar_descuento_stock_congelado(stock_iq_original, ventas_df):
     """
     Regresa stock_iq ajustado:
-    stock actual calculado = stock congelado - ventas posteriores al corte.
+    stock actual calculado =
+        stock congelado
+        + arribos Odoo Compras posteriores al corte
+        - ventas posteriores al corte.
 
-    El descuento se hace primero sobre stock_total.
-    Para conservar el desglose por canal, se descuenta proporcionalmente de cada canal
-    según la composición del stock congelado.
+    Para conservar el desglose por canal, el stock total calculado se distribuye
+    proporcionalmente sobre los canales del stock congelado. El ajuste por
+    redondeo se manda a Odoo Cuautitlán.
     """
     if not USAR_STOCK_CONGELADO:
-        return stock_iq_original.copy(), pd.DataFrame()
+        return stock_iq_original.copy(), pd.DataFrame(), pd.DataFrame()
 
     stock_congelado = cargar_o_crear_stock_congelado(stock_iq_original)
     ventas_post = calcular_ventas_posteriores_corte(ventas_df)
+    arribos_post, arribos_odoo_detalle = calcular_arribos_posteriores_corte_odoo()
 
     base = stock_congelado.merge(ventas_post, on="sku_madre", how="left")
+    base = base.merge(arribos_post, on="sku_madre", how="left")
 
-    for c in ["ventas_post_corte_unidades", "ventas_post_corte_monto", "pedidos_post_corte"]:
+    for c in [
+        "ventas_post_corte_unidades", "ventas_post_corte_monto", "pedidos_post_corte",
+        "arribos_post_corte_unidades", "arribos_post_corte_monto",
+    ]:
         if c not in base.columns:
             base[c] = 0
         base[c] = to_num(base[c])
 
-    base["stock_total_antes_descuento"] = base["stock_total_congelado"]
+    for c in [
+        "ordenes_compra_arribos", "proveedores_arribos",
+        "primera_fecha_arribo", "ultima_fecha_arribo"
+    ]:
+        if c not in base.columns:
+            base[c] = ""
+
+    base["stock_total_antes_movimientos"] = base["stock_total_congelado"]
+    base["stock_total_antes_descuento"] = base["stock_total_congelado"] + base["arribos_post_corte_unidades"]
+
     base["stock_total"] = np.maximum(
-        base["stock_total_congelado"] - base["ventas_post_corte_unidades"],
+        base["stock_total_congelado"]
+        + base["arribos_post_corte_unidades"]
+        - base["ventas_post_corte_unidades"],
         0
     )
 
-    # Factor proporcional para bajar stock de canales sin inventar asignación por canal.
+    # Factor proporcional para ajustar stock de canales sin inventar asignación exacta por canal.
+    base["base_para_distribucion"] = base["stock_total_congelado"] + base["arribos_post_corte_unidades"]
+
     base["factor_stock_restante"] = np.where(
-        base["stock_total_congelado"] > 0,
-        base["stock_total"] / base["stock_total_congelado"],
+        base["base_para_distribucion"] > 0,
+        base["stock_total"] / base["base_para_distribucion"],
         0
+    )
+
+    # Arribos se agregan provisionalmente a Odoo Cuautitlán antes de distribuir.
+    base["stock_walmart_wfs_base_mov"] = base.get("stock_walmart_wfs_congelado", 0)
+    base["stock_liverpool_99min_base_mov"] = base.get("stock_liverpool_99min_congelado", 0)
+    base["stock_meli_full_base_mov"] = base.get("stock_meli_full_congelado", 0)
+    base["stock_amazon_fba_base_mov"] = base.get("stock_amazon_fba_congelado", 0)
+    base["stock_odoo_cuautitlan_base_mov"] = (
+        base.get("stock_odoo_cuautitlan_congelado", 0)
+        + base["arribos_post_corte_unidades"]
     )
 
     canales = [
-        ("stock_walmart_wfs_congelado", "stock_walmart_wfs"),
-        ("stock_liverpool_99min_congelado", "stock_liverpool_99min"),
-        ("stock_meli_full_congelado", "stock_meli_full"),
-        ("stock_amazon_fba_congelado", "stock_amazon_fba"),
-        ("stock_odoo_cuautitlan_congelado", "stock_odoo_cuautitlan"),
+        ("stock_walmart_wfs_base_mov", "stock_walmart_wfs"),
+        ("stock_liverpool_99min_base_mov", "stock_liverpool_99min"),
+        ("stock_meli_full_base_mov", "stock_meli_full"),
+        ("stock_amazon_fba_base_mov", "stock_amazon_fba"),
+        ("stock_odoo_cuautitlan_base_mov", "stock_odoo_cuautitlan"),
     ]
 
-    for congelado, actual in canales:
-        if congelado not in base.columns:
-            base[congelado] = 0
+    for base_col, actual in canales:
+        if base_col not in base.columns:
+            base[base_col] = 0
         base[actual] = np.maximum(
-            np.floor(base[congelado] * base["factor_stock_restante"]),
+            np.floor(to_num(base[base_col]) * base["factor_stock_restante"]),
             0
         )
 
@@ -1072,15 +1379,16 @@ def aplicar_descuento_stock_congelado(stock_iq_original, ventas_df):
     base["producto_madre"] = base.get("producto_madre_stock", "")
     base["stock_calculado_desde_congelado"] = "SI"
     base["fecha_corte_stock"] = FECHA_CORTE_STOCK
-    base["formula_stock"] = "stock_congelado_02062026_1500 - ventas_posteriores_al_corte"
+    base["formula_stock"] = "stock_congelado_02062026_1500 + arribos_odoo_compras_post_corte - ventas_posteriores_al_corte"
 
-    # Deja columnas compatibles con el resto del script.
     cols = [
         "sku_madre", "producto_madre",
         "stock_walmart_wfs", "stock_liverpool_99min", "stock_meli_full",
         "stock_amazon_fba", "stock_odoo_cuautitlan", "stock_total",
-        "stock_total_congelado", "ventas_post_corte_unidades", "ventas_post_corte_monto",
-        "pedidos_post_corte", "stock_total_antes_descuento",
+        "stock_total_congelado", "arribos_post_corte_unidades", "arribos_post_corte_monto",
+        "ordenes_compra_arribos", "proveedores_arribos", "primera_fecha_arribo", "ultima_fecha_arribo",
+        "ventas_post_corte_unidades", "ventas_post_corte_monto",
+        "pedidos_post_corte", "stock_total_antes_movimientos", "stock_total_antes_descuento",
         "stock_calculado_desde_congelado", "fecha_corte_stock", "formula_stock"
     ]
     for c in cols:
@@ -1089,7 +1397,8 @@ def aplicar_descuento_stock_congelado(stock_iq_original, ventas_df):
 
     auditoria = base.copy()
 
-    return base[cols].copy(), auditoria
+    return base[cols].copy(), auditoria, arribos_odoo_detalle
+
 
 
 # ============================================================
@@ -1101,7 +1410,7 @@ if stock_iq.empty and not rotacion.empty:
 
 # Aplicar stock congelado:
 # stock actual calculado = stock congelado al 02/06/2026 15:00 - ventas posteriores al corte.
-stock_iq, auditoria_stock_congelado = aplicar_descuento_stock_congelado(stock_iq, ventas)
+stock_iq, auditoria_stock_congelado, arribos_odoo_compras_detalle = aplicar_descuento_stock_congelado(stock_iq, ventas)
 
 for col in [
     "stock_walmart_wfs",
@@ -1171,10 +1480,13 @@ dashboard = all_iq.merge(stock_base, on="sku_madre", how="left")
 # Adjuntar auditoría de stock congelado al producto.
 if USAR_STOCK_CONGELADO and "auditoria_stock_congelado" in globals() and not auditoria_stock_congelado.empty:
     cols_aud = [
-        "sku_madre", "stock_total_congelado", "ventas_post_corte_unidades",
-        "ventas_post_corte_monto", "pedidos_post_corte",
-        "stock_total_antes_descuento", "stock_calculado_desde_congelado",
-        "fecha_corte_stock", "formula_stock"
+        "sku_madre", "stock_total_congelado",
+        "arribos_post_corte_unidades", "arribos_post_corte_monto",
+        "ordenes_compra_arribos", "proveedores_arribos",
+        "primera_fecha_arribo", "ultima_fecha_arribo",
+        "ventas_post_corte_unidades", "ventas_post_corte_monto", "pedidos_post_corte",
+        "stock_total_antes_movimientos", "stock_total_antes_descuento",
+        "stock_calculado_desde_congelado", "fecha_corte_stock", "formula_stock"
     ]
     cols_aud = [c for c in cols_aud if c in auditoria_stock_congelado.columns]
     dashboard = dashboard.merge(
@@ -1203,9 +1515,12 @@ for col in [
     "stock_odoo_cuautitlan",
     "stock_total",
     "stock_total_congelado",
+    "arribos_post_corte_unidades",
+    "arribos_post_corte_monto",
     "ventas_post_corte_unidades",
     "ventas_post_corte_monto",
     "pedidos_post_corte",
+    "stock_total_antes_movimientos",
     "stock_total_antes_descuento",
     "num_skus_sincronizados",
 ]:
@@ -1362,8 +1677,12 @@ cols_dashboard = [
     "skus_sincronizados", "sku_chips_json", "num_skus_sincronizados",
     "ventas_3m_unidades", "ventas_3m_monto", "pedidos_3m", "dias_con_venta_3m",
     "venta_diaria_promedio_3m",
-    "stock_total", "stock_total_congelado", "ventas_post_corte_unidades",
-    "ventas_post_corte_monto", "pedidos_post_corte", "stock_total_antes_descuento",
+    "stock_total", "stock_total_congelado",
+    "arribos_post_corte_unidades", "arribos_post_corte_monto",
+    "ordenes_compra_arribos", "proveedores_arribos",
+    "primera_fecha_arribo", "ultima_fecha_arribo",
+    "ventas_post_corte_unidades", "ventas_post_corte_monto", "pedidos_post_corte",
+    "stock_total_antes_movimientos", "stock_total_antes_descuento",
     "stock_calculado_desde_congelado", "fecha_corte_stock", "formula_stock",
     "stock_odoo_cuautitlan", "stock_amazon_fba", "stock_meli_full",
     "stock_walmart_wfs", "stock_liverpool_99min",
@@ -1441,6 +1760,10 @@ resumen = pd.DataFrame([
     ["usar_stock_congelado", USAR_STOCK_CONGELADO],
     ["fecha_corte_stock", FECHA_CORTE_STOCK.strftime("%Y-%m-%d %H:%M:%S")],
     ["archivo_stock_congelado", str(ARCHIVO_STOCK_CONGELADO)],
+    ["arribos_odoo_compras_activo", ENABLE_ODOO_ARRIBOS_COMPRAS],
+    ["arribos_post_corte_unidades", float(dashboard_productos["arribos_post_corte_unidades"].sum()) if "arribos_post_corte_unidades" in dashboard_productos.columns else 0],
+    ["arribos_post_corte_monto", float(dashboard_productos["arribos_post_corte_monto"].sum()) if "arribos_post_corte_monto" in dashboard_productos.columns else 0],
+    ["renglones_arribos_odoo_compras", len(arribos_odoo_compras_detalle) if "arribos_odoo_compras_detalle" in globals() and isinstance(arribos_odoo_compras_detalle, pd.DataFrame) else 0],
     ["iq_en_dashboard", len(dashboard_productos)],
     ["iq_top80", int((dashboard_productos["top_80_flag"] == "SI").sum())],
     ["ventas_3m_unidades", float(dashboard_productos["ventas_3m_unidades"].sum())],
@@ -1470,6 +1793,8 @@ with pd.ExcelWriter(ARCHIVO_SALIDA, engine="openpyxl") as writer:
     stock_no_vinculado.to_excel(writer, sheet_name="stock_no_vinculado", index=False)
     if "auditoria_stock_congelado" in globals() and isinstance(auditoria_stock_congelado, pd.DataFrame):
         auditoria_stock_congelado.to_excel(writer, sheet_name="auditoria_stock_congelado", index=False)
+    if "arribos_odoo_compras_detalle" in globals() and isinstance(arribos_odoo_compras_detalle, pd.DataFrame):
+        arribos_odoo_compras_detalle.to_excel(writer, sheet_name="arribos_odoo_compras", index=False)
     parametros_lead_time.to_excel(writer, sheet_name="parametros_lead_time", index=False)
     dic_aliases.to_excel(writer, sheet_name="sku_marketplace_aliases", index=False)
 
@@ -1497,4 +1822,9 @@ print(f"Stock no vinculado SKUs: {stock_no_vinculado_skus}")
 print(f"Stock congelado activo: {USAR_STOCK_CONGELADO}")
 print(f"Fecha corte stock: {FECHA_CORTE_STOCK}")
 print(f"Archivo stock congelado: {ARCHIVO_STOCK_CONGELADO}")
+print(f"Arribos Odoo compras activo: {ENABLE_ODOO_ARRIBOS_COMPRAS}")
+if "arribos_odoo_compras_detalle" in globals() and isinstance(arribos_odoo_compras_detalle, pd.DataFrame):
+    print(f"Renglones arribos Odoo compras: {len(arribos_odoo_compras_detalle)}")
+    if not arribos_odoo_compras_detalle.empty and "cantidad_arribada" in arribos_odoo_compras_detalle.columns:
+        print(f"Cantidad arribada Odoo compras: {arribos_odoo_compras_detalle['cantidad_arribada'].sum():,.0f}")
 

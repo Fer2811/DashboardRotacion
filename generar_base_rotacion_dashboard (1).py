@@ -52,11 +52,11 @@ ARCHIVO_SALIDA = CARPETA_SALIDA / "rotacion_inventario_base_dashboard_odoo_autoa
 # El código lo buscará primero en Desktop y luego en Downloads.
 #
 # Ejemplo actual:
-#   VentasAZ9JUN.xlsx
+#   VentasAZ10JUN.xlsx
 #
 # Si lo dejas vacío, volverá a buscar por patrones:
 #   "listado detallado" + "pedidos"
-ARCHIVO_AUTOAZUR_ACTUALIZADO = "VentasAZ9JUN.xlsx"
+ARCHIVO_AUTOAZUR_ACTUALIZADO = "VentasAZ10JUN.xlsx"
 
 FECHA_INICIO = pd.Timestamp("2025-11-01")
 FECHA_FIN = pd.Timestamp.today().normalize()
@@ -272,9 +272,9 @@ def encontrar_archivo_autoazur_actualizado():
     """
     Busca primero el archivo Autoazur actualizado por nombre exacto.
     Prioridad:
-      1) Desktop/VentasAZ9JUN.xlsx
-      2) Downloads/VentasAZ9JUN.xlsx
-      3) Desktop/rotacion_inventario_base_dashboard/VentasAZ9JUN.xlsx
+      1) Desktop/VentasAZ10JUN.xlsx
+      2) Downloads/VentasAZ10JUN.xlsx
+      3) Desktop/rotacion_inventario_base_dashboard/VentasAZ10JUN.xlsx
       4) Búsqueda por patrones en Desktop: listado detallado + pedidos
       5) Búsqueda por patrones en Downloads: listado detallado + pedidos
     """

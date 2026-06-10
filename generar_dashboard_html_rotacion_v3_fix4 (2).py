@@ -20,12 +20,15 @@ import numpy as np
 import subprocess
 from datetime import datetime
 
+FECHA_GENERACION = datetime.now().strftime("%d/%m/%Y %H:%M")
+
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
 #DESKTOP = Path.home() / "Desktop"
+#CARPETA = DESKTOP / "rotacion_inventario_base_dashboard"
 CARPETA = Path(r"C:\Users\luisf\IQ Tech\DashboardRotacion")
 
 ARCHIVO_BASE = CARPETA / "base_dashboard_rotacion.xlsx"
@@ -144,8 +147,12 @@ def df_to_table_rows(df, cols, max_rows=500):
                 val_html = f'<span class="{clase_recomendacion_py(val)}">{safe_text(val)}</span>'
             elif c in ["ventas_3m_monto", "venta_total"]:
                 val_html = fmt_money(val)
-            elif c in ["ventas_3m_unidades", "stock_total", "sugerencia_compra"]:
+            elif c in ["ventas_3m_unidades", "stock_total", "stock_total_congelado",
+                       "arribos_post_corte_unidades", "ventas_post_corte_unidades",
+                       "sugerencia_compra", "cantidad_arribada", "cantidad_ordenada"]:
                 val_html = fmt_num(val, 0)
+            elif c in ["arribos_post_corte_monto", "ventas_post_corte_monto", "subtotal", "precio_unitario"]:
+                val_html = fmt_money(val)
             elif c in ["dias_para_comprar", "dias_inventario_num"]:
                 val_html = fmt_num(val, 1)
             else:
@@ -168,7 +175,14 @@ productos = pd.read_excel(ARCHIVO_BASE, sheet_name="dashboard_productos")
 ventas_no = pd.read_excel(ARCHIVO_BASE, sheet_name="ventas_no_vinculadas")
 stock_no = pd.read_excel(ARCHIVO_BASE, sheet_name="stock_no_vinculado")
 
-for df in [productos, ventas_no, stock_no]:
+# Hoja nueva generada por:
+# generar_base_dashboard_rotacion_v8_todos_arribos_odoo.py
+try:
+    arribos_odoo = pd.read_excel(ARCHIVO_BASE, sheet_name="arribos_odoo_compras")
+except Exception:
+    arribos_odoo = pd.DataFrame()
+
+for df in [productos, ventas_no, stock_no, arribos_odoo]:
     df.columns = [str(c).strip() for c in df.columns]
 
 # En la pestaña de stock no vinculado solo queremos SKUs con stock_total > 0.
@@ -182,10 +196,17 @@ for col in [
     "stock_odoo_cuautitlan", "stock_amazon_fba", "stock_meli_full",
     "stock_walmart_wfs", "stock_liverpool_99min", "sugerencia_compra",
     "objetivo_stock_45_dias", "venta_diaria_promedio_3m",
-    "participacion_ventas_3m", "participacion_acumulada_3m"
+    "participacion_ventas_3m", "participacion_acumulada_3m",
+    "stock_total_congelado", "arribos_post_corte_unidades", "arribos_post_corte_monto",
+    "ventas_post_corte_unidades", "ventas_post_corte_monto",
+    "stock_total_antes_movimientos", "stock_total_antes_descuento"
 ]:
     if col in productos.columns:
         productos[col] = pd.to_numeric(productos[col], errors="coerce").fillna(0)
+
+for col in ["cantidad_arribada", "cantidad_ordenada", "precio_unitario", "subtotal"]:
+    if col in arribos_odoo.columns:
+        arribos_odoo[col] = pd.to_numeric(arribos_odoo[col], errors="coerce").fillna(0)
 
 # ============================================================
 # KPIS
@@ -203,18 +224,31 @@ no_vinc = len(ventas_no)
 stock_no_skus = stock_no["sku_original"].nunique() if "sku_original" in stock_no.columns and not stock_no.empty else len(stock_no)
 stock_no_units = stock_no["stock_total"].sum() if "stock_total" in stock_no.columns and not stock_no.empty else 0
 
+arribos_total_rows = len(arribos_odoo)
+arribos_total_units = arribos_odoo["cantidad_arribada"].sum() if "cantidad_arribada" in arribos_odoo.columns and not arribos_odoo.empty else 0
+if "post_corte_stock" in arribos_odoo.columns:
+    arribos_post_rows = int(arribos_odoo["post_corte_stock"].astype(str).str.upper().eq("SI").sum())
+    arribos_post_units = arribos_odoo.loc[
+        arribos_odoo["post_corte_stock"].astype(str).str.upper().eq("SI"),
+        "cantidad_arribada"
+    ].sum() if "cantidad_arribada" in arribos_odoo.columns else 0
+else:
+    arribos_post_rows = 0
+    arribos_post_units = productos["arribos_post_corte_unidades"].sum() if "arribos_post_corte_unidades" in productos.columns else 0
+
 # ============================================================
 # TABLAS
 # ============================================================
 
 tabla_cols = [
     "sku_madre", "producto_madre", "ranking_top80",
-    "ventas_3m_unidades", "stock_total", "sugerencia_compra",
-    "dias_inventario_texto", "lead_time_dias", "dias_para_comprar",
+    "ventas_3m_unidades", "stock_total", "stock_total_congelado",
+    "arribos_post_corte_unidades", "ventas_post_corte_unidades",
+    "sugerencia_compra", "dias_inventario_texto", "lead_time_dias", "dias_para_comprar",
     "alerta_compra", "riesgo_sobrestock", "prioridad", "recomendacion",
 ]
 tabla_cols = [c for c in tabla_cols if c in productos.columns]
-tabla_rows = df_to_table_rows(productos.sort_values("ventas_3m_unidades", ascending=False), tabla_cols, max_rows=1000)
+tabla_rows = df_to_table_rows(productos.sort_values("ventas_3m_monto", ascending=False), tabla_cols, max_rows=1000)
 tabla_head = "".join(f"<th>{safe_text(c)}</th>" for c in tabla_cols)
 
 no_cols_pref = [
@@ -239,9 +273,21 @@ if not stock_no_cols:
 stock_no_rows = df_to_table_rows(stock_no, stock_no_cols, max_rows=1000)
 stock_no_head = "".join(f"<th>{safe_text(c)}</th>" for c in stock_no_cols)
 
+arribos_cols_pref = [
+    "fecha", "post_corte_stock", "orden_compra", "proveedor", "referencia_interna",
+    "producto", "cantidad_arribada", "cantidad_ordenada", "sku_odoo",
+    "barcode", "estado_compra", "origen", "precio_unitario", "subtotal"
+]
+arribos_cols = [c for c in arribos_cols_pref if c in arribos_odoo.columns]
+if not arribos_cols:
+    arribos_cols = arribos_odoo.columns.tolist()[:14]
+arribos_rows = df_to_table_rows(arribos_odoo, arribos_cols, max_rows=3000)
+arribos_head = "".join(f"<th>{safe_text(c)}</th>" for c in arribos_cols)
+
 productos_js = df_to_js_records(productos)
 ventas_no_js = df_to_js_records(ventas_no)
 stock_no_js = df_to_js_records(stock_no)
+arribos_js = df_to_js_records(arribos_odoo)
 
 # ============================================================
 # HTML
@@ -311,7 +357,7 @@ body {{
 .tab-content.active {{ display:block; }}
 .kpi-grid {{
   display:grid;
-  grid-template-columns:repeat(9,minmax(145px,1fr));
+  grid-template-columns:repeat(10,minmax(145px,1fr));
   gap:18px;
   margin-bottom:28px;
 }}
@@ -539,6 +585,28 @@ tr:hover td {{ background:#f8fafc; }}
   .detail-grid {{ grid-template-columns:1fr; }}
   .alert-split {{ grid-template-columns:1fr; }}
 }}
+
+.dashboard-header{{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:20px;
+  padding:18px 24px;
+  background:white;
+  border-radius:18px;
+  box-shadow:var(--shadow);
+  border:1px solid rgba(148,163,184,.18);
+}}
+.dashboard-title{{
+  font-size:32px;
+  font-weight:900;
+  margin:0;
+}}
+.dashboard-date{{
+  color:#667085;
+  font-size:15px;
+  font-weight:700;
+}}
 </style>
 </head>
 <body>
@@ -549,13 +617,15 @@ tr:hover td {{ background:#f8fafc; }}
     <button class="tab-btn" onclick="showTab('detail', this)">Detalle por producto</button>
     <button class="tab-btn" onclick="showTab('unlinked', this)">Ventas no vinculadas</button>
     <button class="tab-btn" onclick="showTab('stockUnlinked', this)">Stock no vinculado</button>
+    <button class="tab-btn" onclick="showTab('arribosOdoo', this)">Arribos Odoo</button>
   </div>
 
   <section id="main" class="tab-content active">
     <div class="kpi-grid">
       <div class="metric-card"><div class="metric-title">IQ en dashboard</div><div class="metric-value">{fmt_num(total_iq)}</div><div class="metric-sub">Con stock o ventas 3M</div></div>
       <div class="metric-card"><div class="metric-title">Ventas últimos 3 meses</div><div class="metric-value">{fmt_num(ventas_u)}</div><div class="metric-sub">{fmt_money(ventas_monto)}</div></div>
-      <div class="metric-card"><div class="metric-title">Stock total</div><div class="metric-value">{fmt_num(stock_total)}</div><div class="metric-sub">Inventario consolidado</div></div>
+      <div class="metric-card"><div class="metric-title">Stock total</div><div class="metric-value">{fmt_num(stock_total)}</div><div class="metric-sub">Congelado + arribos - ventas</div></div>
+      <div class="metric-card"><div class="metric-title">Arribos Odoo</div><div class="metric-value">{fmt_num(arribos_total_rows)}</div><div class="metric-sub">{fmt_num(arribos_total_units)} unidades totales · {fmt_num(arribos_post_units)} post-corte</div></div>
       <div class="metric-card"><div class="metric-title">Top 80% ventas $</div><div class="metric-value">{fmt_num(top80_count)}</div><div class="metric-sub">IQ dentro del Pareto por monto</div></div>
       <div class="metric-card"><div class="metric-title">Comprar ya</div><div class="metric-value">{fmt_num(comprar_ya)}</div><div class="metric-sub">Inventario acabado o debajo del lead time</div></div>
       <div class="metric-card"><div class="metric-title">Compra con urgencia</div><div class="metric-value">{fmt_num(urgencia)}</div><div class="metric-sub">Inventario próximo a acabar</div></div>
@@ -670,12 +740,37 @@ tr:hover td {{ background:#f8fafc; }}
     </div>
   </section>
 
+  <section id="arribosOdoo" class="tab-content">
+    <div class="card">
+      <h2>Arribos Odoo Compras</h2>
+      <p style="color:#667085;margin-top:-8px;">
+        Todos los renglones recibidos desde Odoo Compras. La columna <b>post_corte_stock</b>
+        indica cuáles se suman al stock congelado.
+      </p>
+      <div class="detail-grid">
+        <div class="mini-metric"><div class="mini-title">Renglones totales</div><div class="mini-value">{fmt_num(arribos_total_rows)}</div></div>
+        <div class="mini-metric"><div class="mini-title">Unidades totales recibidas</div><div class="mini-value">{fmt_num(arribos_total_units)}</div></div>
+        <div class="mini-metric"><div class="mini-title">Unidades post-corte</div><div class="mini-value">{fmt_num(arribos_post_units)}</div></div>
+      </div>
+      <br>
+      <input class="search" id="arribosSearch" placeholder="Buscar por IQ, producto, proveedor u orden..." onkeyup="filterTable('arribosSearch','arribosTable')">
+      <br><br>
+      <div class="table-wrap">
+        <table id="arribosTable">
+          <thead><tr>{arribos_head}</tr></thead>
+          <tbody>{arribos_rows}</tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
 </div>
 
 <script>
 const PRODUCTS = {productos_js};
 const VENTAS_NO = {ventas_no_js};
 const STOCK_NO = {stock_no_js};
+const ARRIBOS_ODOO = {arribos_js};
 
 const COLORS = {{
   red: "#ef4444",
@@ -993,7 +1088,9 @@ function renderProductDetail(index) {{
       <div class="detail-grid">
         ${{metricHtml("Ventas 3M", fmtNum(p.ventas_3m_unidades), fmtMoney(p.ventas_3m_monto))}}
         ${{metricHtml("Promedio diario", fmtNum(p.venta_diaria_promedio_3m, 2), "solo días con ventas > 0")}}
-        ${{metricHtml("Stock total", fmtNum(p.stock_total), "unidades")}}
+        ${{metricHtml("Stock total", fmtNum(p.stock_total), "congelado + arribos - ventas")}}
+        ${{metricHtml("Arribos post-corte", fmtNum(p.arribos_post_corte_unidades), fmtMoney(p.arribos_post_corte_monto))}}
+        ${{metricHtml("Ventas post-corte", fmtNum(p.ventas_post_corte_unidades), fmtMoney(p.ventas_post_corte_monto))}}
         ${{metricHtml("Días inventario", esc(p.dias_inventario_texto), "stock / promedio diario")}}
         ${{metricHtml("Lead time", fmtNum(p.lead_time_dias), "días")}}
         ${{metricHtml("Sugerencia compra", fmtNum(p.sugerencia_compra), "cobertura 45 días")}}
@@ -1017,6 +1114,9 @@ function renderProductDetail(index) {{
             <div class="info-row"><div class="info-label">Participación ventas $ <span class="hint" title="Porcentaje que representa este IQ sobre el monto vendido total de los últimos 3 meses.">?</span></div><div class="info-value">${{fmtNum(Number(p.participacion_ventas_3m || 0) * 100, 2)}}%</div></div>
             <div class="info-row"><div class="info-label">Participación acumulada $ <span class="hint" title="Suma acumulada de participación en monto vendido al ordenar los IQ de mayor a menor venta. Sirve para construir el Pareto 80/20.">?</span></div><div class="info-value">${{fmtNum(Number(p.participacion_acumulada_3m || 0) * 100, 2)}}%</div></div>
             <div class="info-row"><div class="info-label">Prioridad</div><div class="info-value">${{esc(p.prioridad)}}</div></div>
+            <div class="info-row"><div class="info-label">Stock congelado</div><div class="info-value">${{fmtNum(p.stock_total_congelado)}}</div></div>
+            <div class="info-row"><div class="info-label">Fecha corte stock</div><div class="info-value">${{esc(p.fecha_corte_stock || "")}}</div></div>
+            <div class="info-row"><div class="info-label">Órdenes con arribo</div><div class="info-value">${{esc(p.ordenes_compra_arribos || "-")}}</div></div>
             <div class="info-row"><div class="info-label">Riesgo días</div><div class="info-value">${{badgeHtml(p.riesgo_sobrestock, riesgoColor(p.riesgo_sobrestock))}}</div></div>
             <div class="info-row"><div class="info-label">Días para comprar</div><div class="info-value">${{fmtNum(p.dias_para_comprar, 1)}}</div></div>
             <div class="info-row"><div class="info-label">Objetivo stock 45 días</div><div class="info-value">${{fmtNum(p.objetivo_stock_45_dias, 0)}}</div></div>
@@ -1042,9 +1142,8 @@ document.addEventListener("DOMContentLoaded", () => {{
 
 ARCHIVO_HTML.write_text(html_doc, encoding="utf-8")
 
-print("\nDASHBOARD HTML V3 GENERADO")
+print("\nDASHBOARD HTML V7 GENERADO")
 print(f"Archivo: {ARCHIVO_HTML}")
-
 
 # ============================================
 # PUBLICAR AUTOMÁTICAMENTE EN GITHUB
