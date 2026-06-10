@@ -17,19 +17,21 @@ import json
 import html
 import pandas as pd
 import numpy as np
+import subprocess
+from datetime import datetime
 
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
-DESKTOP = Path.home() / "Desktop"
+#DESKTOP = Path.home() / "Desktop"
 #CARPETA = DESKTOP / "rotacion_inventario_base_dashboard"
-CARPETA = Path(r"C:\Users\luisf\IQ Tech\Codigos Hector")
+CARPETA = Path(r"C:\Users\luisf\IQ Tech\DashboardRotacion")
 
 ARCHIVO_BASE = CARPETA / "base_dashboard_rotacion.xlsx"
-ARCHIVO_HTML = CARPETA / "dashboard_rotacion.html"
-
+#ARCHIVO_HTML = CARPETA / "dashboard_rotacion.html"
+ARCHIVO_HTML = Path(r"C:\Users\luisf\DashboardRotacion\index.html")
 
 # ============================================================
 # FUNCIONES
@@ -1043,3 +1045,59 @@ ARCHIVO_HTML.write_text(html_doc, encoding="utf-8")
 
 print("\nDASHBOARD HTML V3 GENERADO")
 print(f"Archivo: {ARCHIVO_HTML}")
+
+# ============================================
+# PUBLICAR AUTOMÁTICAMENTE EN GITHUB
+# ============================================
+
+REPO = Path(r"C:\Users\luisf\DashboardRotacion")
+
+try:
+
+    estado = subprocess.run(
+        ["git", "-C", str(REPO), "status", "--porcelain"],
+        capture_output=True,
+        text=True
+    )
+
+    if estado.stdout.strip():
+
+        fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        subprocess.run(
+            ["git", "-C", str(REPO), "add", "index.html"],
+            check=True
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(REPO),
+                "commit",
+                "-m",
+                f"Actualización automática {fecha}"
+            ],
+            check=True
+        )
+
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(REPO),
+                "push",
+                "origin",
+                "main"
+            ],
+            check=True
+        )
+
+        print("\nDashboard publicado correctamente en GitHub Pages.")
+
+    else:
+        print("\nNo hubo cambios en index.html.")
+
+except Exception as e:
+    print("\nError al publicar en GitHub:")
+    print(e)
