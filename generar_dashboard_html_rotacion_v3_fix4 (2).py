@@ -612,6 +612,15 @@ tr:hover td {{ background:#f8fafc; }}
 <body>
 <div class="container">
 
+  <div class="dashboard-header">
+      <div>
+          <h1 class="dashboard-title">Dashboard Rotación Inventario</h1>
+      </div>
+      <div class="dashboard-date">
+          Actualizado: {FECHA_GENERACION}
+      </div>
+  </div>
+
   <div class="tabs">
     <button class="tab-btn active" onclick="showTab('main', this)">Dashboard principal</button>
     <button class="tab-btn" onclick="showTab('detail', this)">Detalle por producto</button>
