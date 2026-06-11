@@ -56,7 +56,7 @@ ARCHIVO_SALIDA = CARPETA_SALIDA / "rotacion_inventario_base_dashboard_odoo_autoa
 #
 # Si lo dejas vacío, volverá a buscar por patrones:
 #   "listado detallado" + "pedidos"
-ARCHIVO_AUTOAZUR_ACTUALIZADO = "VentasAZ10JUN.xlsx"
+ARCHIVO_AUTOAZUR_ACTUALIZADO = "VentasAZ11JUN.xlsx"
 
 FECHA_INICIO = pd.Timestamp("2025-11-01")
 FECHA_FIN = pd.Timestamp.today().normalize()
