@@ -895,45 +895,64 @@ def detectar_campos_log(odoo, model):
 
 def extraer_imagenes_odoo_por_iq(iq_list):
     """
-    Extrae imágenes directamente desde Odoo por referencia interna IQ.
+    Extrae imágenes desde Odoo usando default_code (IQ).
 
-    Busca en product.product.default_code y toma image_512.
-    Regresa:
-    sku_madre, imagen_odoo_base64, producto_imagen_odoo
+    No filtra por image_512 en el dominio porque image_512
+    no es un campo almacenado y Odoo genera:
+        Cannot convert product.product.image_512 to SQL
+
+    El filtrado se hace después de descargar los registros.
     """
-    cols = ["sku_madre", "imagen_odoo_base64_api", "producto_imagen_odoo"]
+
+    cols = [
+        "sku_madre",
+        "imagen_odoo_base64_api",
+        "producto_imagen_odoo"
+    ]
 
     if not ENABLE_ODOO_IMAGENES_PRODUCTOS:
         return pd.DataFrame(columns=cols)
 
     if not es_credencial_odoo_valida():
-        print("Imágenes Odoo omitidas: credenciales no configuradas.")
+        print("Imágenes Odoo omitidas.")
         return pd.DataFrame(columns=cols)
 
-    iq_list = [
+    iq_list = sorted(set(
         str(x).strip().upper()
         for x in iq_list
         if str(x).strip().upper().startswith("IQ")
-    ]
-    iq_list = sorted(set(iq_list))
+    ))
 
-    if not iq_list:
+    if len(iq_list) == 0:
         return pd.DataFrame(columns=cols)
 
     try:
-        odoo = OdooClient(ODOO_URL, ODOO_DB, ODOO_USER, ODOO_API_KEY)
+
+        odoo = OdooClient(
+            ODOO_URL,
+            ODOO_DB,
+            ODOO_USER,
+            ODOO_API_KEY
+        )
         odoo.connect()
 
         rows_all = []
+
         chunk_size = 300
 
         for i in range(0, len(iq_list), chunk_size):
-            chunk = iq_list[i:i + chunk_size]
+
+            chunk = iq_list[i:i+chunk_size]
+
             domain = [
-                ("default_code", "in", chunk),
-                (ODOO_CAMPO_IMAGEN_PRODUCTO, "!=", False),
+                ("default_code", "in", chunk)
             ]
-            fields = ["id", "display_name", "default_code", ODOO_CAMPO_IMAGEN_PRODUCTO]
+
+            fields = [
+                "default_code",
+                "display_name",
+                ODOO_CAMPO_IMAGEN_PRODUCTO
+            ]
 
             rows = odoo.search_read_all(
                 "product.product",
@@ -942,42 +961,80 @@ def extraer_imagenes_odoo_por_iq(iq_list):
                 batch=1000,
                 order="id asc"
             )
+
             rows_all.extend(rows)
 
-        if not rows_all:
-            print("No encontré imágenes Odoo por default_code/IQ.")
+        if len(rows_all) == 0:
+            print("No encontré productos Odoo para imágenes.")
             return pd.DataFrame(columns=cols)
 
         tmp = pd.DataFrame(rows_all)
-        tmp["sku_madre"] = tmp["default_code"].astype(str).str.strip().str.upper()
-        tmp["imagen_odoo_base64_api"] = tmp[ODOO_CAMPO_IMAGEN_PRODUCTO].fillna("").astype(str)
-        tmp["producto_imagen_odoo"] = tmp["display_name"].fillna("").astype(str)
+
+        tmp["sku_madre"] = (
+            tmp["default_code"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+
+        tmp["imagen_odoo_base64_api"] = (
+            tmp[ODOO_CAMPO_IMAGEN_PRODUCTO]
+            .fillna("")
+            .astype(str)
+        )
+
+        tmp["producto_imagen_odoo"] = (
+            tmp["display_name"]
+            .fillna("")
+            .astype(str)
+        )
 
         tmp = tmp[
             tmp["sku_madre"].str.match(r"^IQ\d+$", na=False)
-            & tmp["imagen_odoo_base64_api"].str.strip().ne("")
-            & tmp["imagen_odoo_base64_api"].str.lower().ne("false")
-        ].copy()
+        ]
+
+        tmp = tmp[
+            tmp["imagen_odoo_base64_api"]
+            .astype(str)
+            .str.strip()
+            .ne("")
+        ]
+
+        tmp = tmp[
+            tmp["imagen_odoo_base64_api"]
+            .astype(str)
+            .str.lower()
+            .ne("false")
+        ]
 
         if tmp.empty:
-            print("No encontré imágenes Odoo válidas por IQ.")
+            print("No encontré imágenes válidas.")
             return pd.DataFrame(columns=cols)
 
         imagenes = (
-            tmp.groupby("sku_madre", as_index=False)
+            tmp
+            .groupby("sku_madre", as_index=False)
             .agg(
-                imagen_odoo_base64_api=("imagen_odoo_base64_api", first_image_base64),
-                producto_imagen_odoo=("producto_imagen_odoo", first_non_empty),
+                imagen_odoo_base64_api=(
+                    "imagen_odoo_base64_api",
+                    first_image_base64
+                ),
+                producto_imagen_odoo=(
+                    "producto_imagen_odoo",
+                    first_non_empty
+                )
             )
         )
 
-        print(f"Imágenes Odoo encontradas: {len(imagenes)} IQ")
+        print(f"Imágenes Odoo recuperadas: {len(imagenes)}")
+
         return imagenes
 
     except Exception as e:
-        print(f"No pude extraer imágenes desde Odoo: {e}")
-        return pd.DataFrame(columns=cols)
 
+        print(f"No pude extraer imágenes desde Odoo: {e}")
+
+        return pd.DataFrame(columns=cols)
 
 
 def extraer_logs_odoo(fecha_inicio, fecha_fin, dic_map):
