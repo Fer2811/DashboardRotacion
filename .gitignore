@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+index.html
+dashboard_actions.json
+dashboard_odoo_drafts_log.jsonl
+base_dashboard_rotacion.xlsx
+rotacion_inventario_base_dashboard_odoo_autoazur.xlsx
+base_utilidad_roi.xlsx
+stock_full_corte_actual.xlsx
+VentasAZ*.xlsx
+registro_movimientos_odoo.csv
+*.log
+~$*
